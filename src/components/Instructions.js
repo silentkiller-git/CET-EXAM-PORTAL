@@ -1,11 +1,46 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { instructionsData, testData } from '../data/mockData';
 
 function Instructions({ student }) {
   const navigate = useNavigate();
+  const activeExam = useMemo(() => {
+    try {
+      const raw = sessionStorage.getItem('cet_active_exam') || localStorage.getItem('cet_active_exam');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const instructionsData = {
+    general: [
+      'Ensure a stable internet connection throughout the exam.',
+      'The timer is server-controlled and cannot be paused.',
+      'Your answers are auto-saved as you select options.',
+    ],
+    rules: [
+      'Do not refresh or close the browser tab during the exam.',
+      'Once submitted, re-attempt is not allowed.',
+      'Submitting after timeout is not possible; system auto-submits.',
+    ],
+    navigation: [
+      'Use question palette to jump to any question.',
+      'Use mark for review to revisit before final submit.',
+      'Use clear response to remove selected option.',
+      'You can switch between Mathematics, Physics, and Chemistry tabs anytime before final submit.',
+    ],
+    marking: [
+      'Physics and Chemistry generally carry 1 mark per question.',
+      'Mathematics generally carries 2 marks per question.',
+      'Negative marking depends on exam configuration.',
+    ],
+  };
 
   const handleConfirm = () => {
+    if (!activeExam) {
+      navigate('/dashboard');
+      return;
+    }
     navigate('/test');
   };
 
@@ -21,8 +56,11 @@ function Instructions({ student }) {
         <div className="instructions-section">
           <h3>Exam Overview</h3>
           <p>
-            You are about to take the <strong>{testData.examName}</strong>. Please read the
+            You are about to take the <strong>{activeExam?.name || 'Selected Exam'}</strong>. Please read the
             following instructions carefully before proceeding.
+          </p>
+          <p>
+            Duration: <strong>{activeExam?.duration_minutes || 'NA'} minutes</strong>
           </p>
         </div>
 

@@ -1,206 +1,198 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { fetchAdminExams, updateExam } from '../api/client';
 
-function ManageSlots({ institute }) {
+function ManageSlots() {
   const navigate = useNavigate();
-  const [slots, setSlots] = useState([]);
-  const [showForm, setShowForm] = useState(false);
-  const [slotData, setSlotData] = useState({
-    testName: '',
-    date: '',
-    startTime: '',
-    endTime: '',
-    maxStudents: 100,
-    location: '',
-  });
+  const [exams, setExams] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [actionMsg, setActionMsg] = useState('');
 
-  const handleChange = (e) => {
-    const { name, value } = e.target;
-    setSlotData({
-      ...slotData,
-      [name]: name === 'maxStudents' ? parseInt(value) : value,
-    });
-  };
-
-  const handleAddSlot = (e) => {
-    e.preventDefault();
-    const newSlot = {
-      id: 'SLOT-' + Math.random().toString(36).substr(2, 9).toUpperCase(),
-      ...slotData,
-      registeredStudents: 0,
-      status: 'scheduled',
-    };
-    setSlots([...slots, newSlot]);
-    setSlotData({
-      testName: '',
-      date: '',
-      startTime: '',
-      endTime: '',
-      maxStudents: 100,
-      location: '',
-    });
-    setShowForm(false);
-    alert('Exam slot created successfully!');
-  };
-
-  const handleDeleteSlot = (id) => {
-    if (window.confirm('Are you sure you want to delete this slot?')) {
-      setSlots(slots.filter(slot => slot.id !== id));
+  const loadExams = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await fetchAdminExams();
+      setExams(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setError(err.message || 'Failed to load exams');
+    } finally {
+      setLoading(false);
     }
   };
 
+  useEffect(() => {
+    loadExams();
+  }, []);
+
+  const patchExam = async (examId, patch) => {
+    setActionMsg('');
+    try {
+      await updateExam(examId, patch);
+      if (Object.prototype.hasOwnProperty.call(patch, 'show_result_immediately')) {
+        setActionMsg(`Student result visibility turned ${patch.show_result_immediately ? 'ON' : 'OFF'} successfully!`);
+      } else {
+        setActionMsg(`Status updated to "${patch.status}" successfully!`);
+      }
+      await loadExams();
+    } catch (err) {
+      setError(err.message || 'Update failed');
+    }
+  };
+
+  const statusBadge = (status) => {
+    const colors = {
+      draft: { bg: '#f3f4f6', color: '#374151', icon: '📝' },
+      published: { bg: '#dbeafe', color: '#1d4ed8', icon: '📢' },
+      active: { bg: '#dcfce7', color: '#15803d', icon: '▶️' },
+      completed: { bg: '#fef3c7', color: '#92400e', icon: '✅' },
+      evaluated: { bg: '#ede9fe', color: '#6d28d9', icon: '📊' },
+    };
+    const c = colors[status] || { bg: '#f3f4f6', color: '#374151', icon: '❓' };
+    return (
+      <span style={{
+        background: c.bg, color: c.color, padding: '6px 14px',
+        borderRadius: 20, fontWeight: '600', fontSize: '0.85rem', textTransform: 'uppercase',
+        display: 'inline-flex', alignItems: 'center', gap: '6px'
+      }}>
+        {c.icon} {status}
+      </span>
+    );
+  };
+
   return (
-    <div className="form-container">
-      <div className="form-box">
-        <h1>Manage Exam Slots</h1>
-        <button className="add-btn" onClick={() => setShowForm(true)}>
-          + Add New Slot
+    <div className="manage-slots-container">
+      {/* Header */}
+      <div className="manage-slots-header">
+        <div className="manage-slots-title">
+          <span style={{ fontSize: 32, marginRight: 12 }}>📅</span>
+          <div>
+            <h1>Manage Exam Schedule & Status</h1>
+            <p className="manage-slots-subtitle">Control exam lifecycle, visibility, and publication settings</p>
+          </div>
+        </div>
+        <button className="back-btn-header" onClick={() => navigate('/institute-dashboard')}>
+          ← Back to Dashboard
         </button>
+      </div>
 
-        {showForm && (
-          <form onSubmit={handleAddSlot} className="slot-form">
-            <h3>Create Exam Slot</h3>
-            
-            <div className="form-group">
-              <label htmlFor="testName">Test Name</label>
-              <input
-                type="text"
-                id="testName"
-                name="testName"
-                placeholder="Enter test name"
-                value={slotData.testName}
-                onChange={handleChange}
-                required
-              />
-            </div>
+      {/* Content */}
+      <div className="manage-slots-content">
+        {/* Status Messages */}
+        {error && <div className="error-message">{error}</div>}
+        {actionMsg && <div className="success-message">{actionMsg}</div>}
 
-            <div className="form-row">
-              <div className="form-group">
-                <label htmlFor="date">Exam Date</label>
-                <input
-                  type="date"
-                  id="date"
-                  name="date"
-                  value={slotData.date}
-                  onChange={handleChange}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="startTime">Start Time</label>
-                <input
-                  type="time"
-                  id="startTime"
-                  name="startTime"
-                  value={slotData.startTime}
-                  onChange={handleChange}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="endTime">End Time</label>
-                <input
-                  type="time"
-                  id="endTime"
-                  name="endTime"
-                  value={slotData.endTime}
-                  onChange={handleChange}
-                  required
-                />
-              </div>
-            </div>
-
-            <div className="form-row">
-              <div className="form-group">
-                <label htmlFor="maxStudents">Max Students</label>
-                <input
-                  type="number"
-                  id="maxStudents"
-                  name="maxStudents"
-                  min="1"
-                  value={slotData.maxStudents}
-                  onChange={handleChange}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="location">Location</label>
-                <input
-                  type="text"
-                  id="location"
-                  name="location"
-                  placeholder="Exam center location"
-                  value={slotData.location}
-                  onChange={handleChange}
-                  required
-                />
-              </div>
-            </div>
-
-            <div className="form-buttons">
-              <button type="submit" className="create-btn">
-                Create Slot
-              </button>
-              <button
-                type="button"
-                className="cancel-btn"
-                onClick={() => setShowForm(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
+        {/* Loading State */}
+        {loading && (
+          <div className="loading-container">
+            <div className="spinner"></div>
+            <p>Loading exams...</p>
+          </div>
         )}
 
-        <div className="slots-list">
-          <h3>Scheduled Exam Slots ({slots.length})</h3>
-          {slots.length === 0 ? (
-            <p>No exam slots created yet.</p>
-          ) : (
-            <table className="slots-table">
+        {/* Empty State */}
+        {!loading && exams.length === 0 && (
+          <div className="empty-state">
+            <div className="empty-icon">📋</div>
+            <h3>No Exams Found</h3>
+            <p>Create your first exam in the dashboard to manage schedules.</p>
+          </div>
+        )}
+
+        {/* Exams Table */}
+        {!loading && exams.length > 0 && (
+          <div className="exams-table-wrapper">
+            <table className="exams-table">
               <thead>
                 <tr>
-                  <th>Test Name</th>
-                  <th>Date</th>
-                  <th>Time</th>
-                  <th>Location</th>
-                  <th>Capacity</th>
-                  <th>Registered</th>
+                  <th>Exam Name</th>
+                  <th>Start Time</th>
+                  <th>End Time</th>
                   <th>Status</th>
-                  <th>Action</th>
+                  <th>Show Results</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {slots.map((slot) => (
-                  <tr key={slot.id}>
-                    <td>{slot.testName}</td>
-                    <td>{slot.date}</td>
-                    <td>{slot.startTime} - {slot.endTime}</td>
-                    <td>{slot.location}</td>
-                    <td>{slot.maxStudents}</td>
-                    <td>{slot.registeredStudents}</td>
-                    <td><span className="status-badge">{slot.status}</span></td>
-                    <td>
-                      <button
-                        className="delete-btn"
-                        onClick={() => handleDeleteSlot(slot.id)}
-                      >
-                        Delete
-                      </button>
+                {exams.map((exam) => (
+                  <tr key={exam.id} className="exam-row">
+                    <td className="exam-name">
+                      <strong>{exam.name}</strong>
+                    </td>
+                    <td className="exam-time">
+                      {new Date(exam.start_time).toLocaleString()}
+                    </td>
+                    <td className="exam-time">
+                      {new Date(exam.end_time).toLocaleString()}
+                    </td>
+                    <td className="exam-status">
+                      {statusBadge(exam.status)}
+                    </td>
+                    <td className="exam-visibility">
+                      <label className="checkbox-label">
+                        <input
+                          type="checkbox"
+                          checked={!!exam.show_result_immediately}
+                          onChange={(e) => patchExam(exam.id, { show_result_immediately: e.target.checked })}
+                          className="checkbox-input"
+                        />
+                        <span className="checkbox-text">
+                          {exam.show_result_immediately ? '✓ On' : 'Off'}
+                        </span>
+                      </label>
+                    </td>
+                    <td className="exam-actions">
+                      <div className="action-buttons">
+                        {exam.status === 'draft' && (
+                          <button
+                            className="action-btn-small publish"
+                            onClick={() => patchExam(exam.id, { status: 'published' })}
+                            title="Publish this exam"
+                          >
+                            📢 Publish
+                          </button>
+                        )}
+                        {(exam.status === 'draft' || exam.status === 'published') && (
+                          <button
+                            className="action-btn-small activate"
+                            onClick={() => patchExam(exam.id, { status: 'active' })}
+                            title="Activate this exam"
+                          >
+                            ▶️ Activate
+                          </button>
+                        )}
+                        {exam.status === 'active' && (
+                          <button
+                            className="action-btn-small complete"
+                            onClick={() => {
+                              if (window.confirm(`Are you sure you want to mark "${exam.name}" as completed? Students will no longer be able to submit.`)) {
+                                patchExam(exam.id, { status: 'completed' });
+                              }
+                            }}
+                            title="Mark exam as completed"
+                          >
+                            ✅ Complete
+                          </button>
+                        )}
+                        {exam.status === 'completed' && (
+                          <span className="status-text completed">
+                            Exam finished
+                          </span>
+                        )}
+                        {exam.status === 'evaluated' && (
+                          <span className="status-text evaluated">
+                            Results published
+                          </span>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          )}
-        </div>
-
-        <button className="back-btn" onClick={() => navigate('/institute-dashboard')}>
-          Back to Dashboard
-        </button>
+          </div>
+        )}
       </div>
     </div>
   );

@@ -1,462 +1,564 @@
-﻿import React, { useState, useEffect, useCallback } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { testData as mockTestData } from '../data/mockData';
 import QuestionPalette from './QuestionPalette';
 import SubmitModal from './SubmitModal';
+import {
+  fetchExamQuestions,
+  fetchStudentSections,
+  fetchTimer,
+  mediaUrl,
+  saveAnswer,
+  startExam,
+  submitExam,
+} from '../api/client';
 
-/* ─────────────────────────────────────────────
-   Group flat question array by sectionName.
-   Returns: [{ name, questions[] }, ...]
-   Questions without a section go into "General".
-───────────────────────────────────────────────*/
-function groupBySection(questions) {
-  const map = new Map();
-  questions.forEach((q) => {
-    const key = q.sectionName && q.sectionName.trim() !== '' ? q.sectionName.trim() : 'General';
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(q);
-  });
-  // Re-number ids within each section from 1
-  const groups = [];
-  map.forEach((qs, name) => {
-    groups.push({
-      name,
-      questions: qs.map((q, idx) => ({ ...q, sectionIndex: idx + 1 })),
-    });
-  });
-  return groups;
-}
-
-/* ─────────────────────────────────────────────
-   Per-section timer from saved test meta or
-   fallback to equal shares of total duration.
-───────────────────────────────────────────────*/
-function getSectionDurations(testMeta, sectionCount) {
-  if (!testMeta) {
-    const def = Math.floor((mockTestData.duration * 60) / Math.max(sectionCount, 1));
-    return Array(sectionCount).fill(def);
-  }
-  const secs = testMeta.sections;
-  if (secs) {
-    const keys = Object.keys(secs);
-    return keys.slice(0, sectionCount).map((k) => (secs[k].time || 40) * 60);
-  }
-  const share = Math.floor((testMeta.duration || mockTestData.duration) * 60 / Math.max(sectionCount, 1));
-  return Array(sectionCount).fill(share);
-}
-
-/* ─────────────────────────── Main Component ─*/
 function TestPage({ student }) {
   const navigate = useNavigate();
+  const submitRequestedRef = useRef(false);
 
-  const [sections, setSections] = useState([]); // [{name, questions:[]}]
-  const [currentSectionIdx, setCurrentSectionIdx] = useState(0);
-  const [currentQIdx, setCurrentQIdx] = useState(0); // index within current section
-  const [timeLeft, setTimeLeft] = useState(40 * 60);
-  const [sectionDurations, setSectionDurations] = useState([]);
-  const [showSidebar, setShowSidebar] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [exam, setExam] = useState(null);
+  const [attemptId, setAttemptId] = useState('');
+  const [questions, setQuestions] = useState([]);
+  const [sections, setSections] = useState([]);
+  const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(0);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
-  const [sectionLocked, setSectionLocked] = useState(false); // after section submit
-  const [testMeta, setTestMeta] = useState(null);
-  const [allSectionsSubmitted, setAllSectionsSubmitted] = useState(false);
-  const [submittedSections, setSubmittedSections] = useState([]); // indices submitted
-  const [isSaved, setIsSaved] = useState(true); // track if current answer is saved
+  const [submitting, setSubmitting] = useState(false);
+  const [hasActiveAttempt, setHasActiveAttempt] = useState(false);
+  const [answerState, setAnswerState] = useState({});
+  const [visitedQuestions, setVisitedQuestions] = useState({});
+  const [sectionTimeSpent, setSectionTimeSpent] = useState({});
 
-  /* ── load from localStorage ── */
-  useEffect(() => {
-    try {
-      const savedQuestions = localStorage.getItem('cetQuestions');
-      const savedTest = localStorage.getItem('cetTestData');
-      const savedImageMap = localStorage.getItem('cetImageMap');
+  const currentSection = sections[currentSectionIndex] || null;
+  const sectionQuestions = useMemo(() => {
+    if (!currentSection) return [];
+    return questions.filter(q => q.section_id === currentSection.id);
+  }, [questions, currentSection]);
 
-      // Parse image map: { filename -> base64DataURL }
-      let imageMap = {};
-      if (savedImageMap) {
-        try { imageMap = JSON.parse(savedImageMap); } catch (_) { }
-      }
+  const currentQuestion = sectionQuestions[currentQuestionIndex] || null;
+  const attemptStorageKey = attemptId ? `cet_attempt_state_${attemptId}` : '';
 
-      // Build a case-insensitive lookup for imageMap
-      // Keys: lowercase filename (with and without extension) → dataURL
-      const imageMapLower = {};
-      Object.keys(imageMap).forEach((filename) => {
-        const lower = filename.toLowerCase();
-        imageMapLower[lower] = imageMap[filename];
-        // Also store without extension so "Picture" matches "picture.png"
-        const noExt = lower.replace(/\.[^/.]+$/, '');
-        if (!imageMapLower[noExt]) imageMapLower[noExt] = imageMap[filename];
+  const sectionQuestionStats = useMemo(() => {
+    const map = {};
+    sections.forEach((section) => {
+      const sectionQs = questions.filter((q) => q.section_id === section.id);
+      let answered = 0;
+      let review = 0;
+      sectionQs.forEach((q) => {
+        const state = answerState[q.id];
+        if (state?.selected_option != null) answered += 1;
+        if (state?.marked_for_review) review += 1;
       });
-
-      const resolveImage = (imageQuestion) => {
-        if (!imageQuestion || imageQuestion.trim() === '') return null;
-        const key = imageQuestion.trim().toLowerCase();
-        const keyNoExt = key.replace(/\.[^/.]+$/, '');
-        return imageMap[imageQuestion.trim()]        // exact match first
-          || imageMapLower[key]                      // case-insensitive
-          || imageMapLower[keyNoExt]                 // without extension
-          || null;
+      map[section.id] = {
+        total: sectionQs.length,
+        answered,
+        review,
       };
+    });
+    return map;
+  }, [sections, questions, answerState]);
 
-      let raw = [];
-      if (savedQuestions) {
-        raw = JSON.parse(savedQuestions);
-        raw = raw.map(q => ({
-          ...q,
-          imageData: resolveImage(q.imageQuestion)
-        }));
-      } else {
-        // fallback to mockData
-        raw = [
-          { id: 1, sectionName: 'Section A', question: 'Demo Q1 (Section A)', options: [{ id: 'a', text: 'Opt A' }, { id: 'b', text: 'Opt B' }, { id: 'c', text: 'Opt C' }, { id: 'd', text: 'Opt D' }], imageData: null, imageQuestion: '', status: 'not-visited', selectedAnswer: null, markedForReview: false },
-          { id: 2, sectionName: 'Section B', question: 'Demo Q2 (Section B)', options: [{ id: 'a', text: 'Opt A' }, { id: 'b', text: 'Opt B' }, { id: 'c', text: 'Opt C' }, { id: 'd', text: 'Opt D' }], imageData: null, imageQuestion: '', status: 'not-visited', selectedAnswer: null, markedForReview: false },
-        ];
-      }
+  const markedReviewQuestionNumbers = useMemo(() => {
+    return sectionQuestions
+      .map((q, idx) => ({ idx: idx + 1, marked: !!answerState[q.id]?.marked_for_review }))
+      .filter((x) => x.marked)
+      .map((x) => x.idx);
+  }, [sectionQuestions, answerState]);
 
-      const grouped = groupBySection(raw);
-      setSections(grouped);
+  const buildQuestionStatus = (q) => {
+    const a = answerState[q.id];
+    if (!a && !visitedQuestions[q.id]) return 'not-visited';
+    if (!a) return 'clear-response';
+    if (a.marked_for_review) return 'marked-review';
+    if (a.selected_option != null) return 'answered';
+    return 'clear-response';
+  };
 
-      if (savedTest) {
-        const testMeta = JSON.parse(savedTest);
-        setTestMeta(testMeta);
-        const durs = getSectionDurations(testMeta, grouped.length);
-        setSectionDurations(durs);
-        if (durs.length > 0) setTimeLeft(durs[0]);
-      } else {
-        const durs = getSectionDurations(null, grouped.length);
-        setSectionDurations(durs);
-        if (durs.length > 0) setTimeLeft(durs[0]);
-      }
-    } catch (err) {
-      console.error('Error loading test data:', err);
+  const answeredInSection = useMemo(() => {
+    return sectionQuestions.filter(q => answerState[q.id]?.selected_option != null).length;
+  }, [sectionQuestions, answerState]);
+
+  const examId = useMemo(() => {
+    try {
+      const raw = sessionStorage.getItem('cet_active_exam') || localStorage.getItem('cet_active_exam');
+      if (!raw) return '';
+      const parsed = JSON.parse(raw);
+      setExam(parsed);
+      return parsed.id;
+    } catch {
+      return '';
     }
   }, []);
 
-  // Timer countdown
-  useEffect(() => {
-    if (sectionLocked || allSectionsSubmitted || sections.length === 0) return;
+  const persistSubmissionContext = useCallback((payload) => {
+    const endTime = payload?.end_time || new Date().toISOString();
+    const reason = payload?.submission_reason || 'manual';
+    const submittedStudentName = payload?.submitted_student_name || student?.name || student?.username || 'Student';
+    const context = {
+      end_time: endTime,
+      submission_reason: reason,
+      submitted_student_name: submittedStudentName,
+      section_time_spent: sectionTimeSpent,
+    };
+    sessionStorage.setItem('cet_submission_time', endTime);
+    sessionStorage.setItem('cet_submission_reason', reason);
+    sessionStorage.setItem('cet_submitted_student_name', submittedStudentName);
+    sessionStorage.setItem('cet_section_time_spent', JSON.stringify(sectionTimeSpent));
+    sessionStorage.setItem('cet_submission_context', JSON.stringify(context));
+    localStorage.setItem('cet_submission_context', JSON.stringify(context));
+  }, [sectionTimeSpent, student]);
 
+  const handleSubmit = useCallback(async (reason = 'manual') => {
+    if (submitRequestedRef.current || submitting || !examId || !attemptId) return;
+    submitRequestedRef.current = true;
+    setSubmitting(true);
+    setError('');
+    try {
+      const result = await submitExam(examId, {
+        reason,
+        section_time_spent: sectionTimeSpent,
+      });
+      persistSubmissionContext(result);
+      if (attemptStorageKey) {
+        localStorage.removeItem(attemptStorageKey);
+      }
+      navigate('/submitted');
+    } catch (err) {
+      setError(err.message || 'Submission failed');
+      submitRequestedRef.current = false;
+    } finally {
+      setSubmitting(false);
+      setShowSubmitModal(false);
+    }
+  }, [attemptId, attemptStorageKey, examId, navigate, persistSubmissionContext, sectionTimeSpent, submitting]);
+
+  useEffect(() => {
+    if (!examId) {
+      navigate('/dashboard');
+      return;
+    }
+
+    let mounted = true;
+
+    const init = async () => {
+      setLoading(true);
+      setError('');
+      setHasActiveAttempt(false);
+      try {
+        const attempt = await startExam(examId);
+        if (!mounted) return;
+        setAttemptId(attempt.attempt_id);
+        setHasActiveAttempt(true);
+        sessionStorage.setItem('cet_last_attempt', attempt.attempt_id || '');
+
+        const [qData, sData, timerData] = await Promise.all([
+          fetchExamQuestions(examId),
+          fetchStudentSections(examId),
+          fetchTimer(examId)
+        ]);
+
+        if (!mounted) return;
+        setQuestions(Array.isArray(qData) ? qData : []);
+        setSections(sData);
+        sessionStorage.setItem(
+          'cet_section_name_map',
+          JSON.stringify(
+            (sData || []).reduce((acc, section) => {
+              acc[section.id] = section.name;
+              return acc;
+            }, {})
+          )
+        );
+
+          const sectionTimeInit = {};
+          sData.forEach((s) => {
+           sectionTimeInit[s.id] = 0;
+          });
+          setSectionTimeSpent(sectionTimeInit);
+          setCurrentSectionIndex(0);
+          setCurrentQuestionIndex(0);
+
+        setTimeLeft(Math.max(0, Number(timerData.seconds_remaining || 0)));
+      } catch (err) {
+        if (mounted) {
+          setAttemptId('');
+          setHasActiveAttempt(false);
+          setError(err.message || 'Failed to start exam');
+        }
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    };
+
+    init();
+
+    return () => {
+      mounted = false;
+    };
+  }, [examId, navigate]);
+
+  useEffect(() => {
+    if (!attemptStorageKey || !questions.length || !sections.length) return;
+    try {
+      const raw = localStorage.getItem(attemptStorageKey);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (saved.answers && typeof saved.answers === 'object') {
+        setAnswerState(saved.answers);
+      }
+      if (saved.visited && typeof saved.visited === 'object') {
+        setVisitedQuestions(saved.visited);
+      }
+      if (saved.sectionTimeSpent && typeof saved.sectionTimeSpent === 'object') {
+        setSectionTimeSpent((prev) => ({ ...prev, ...saved.sectionTimeSpent }));
+      }
+      if (Number.isInteger(saved.currentSectionIndex) && saved.currentSectionIndex >= 0 && saved.currentSectionIndex < sections.length) {
+        setCurrentSectionIndex(saved.currentSectionIndex);
+      }
+      if (Number.isInteger(saved.currentQuestionIndex) && saved.currentQuestionIndex >= 0) {
+        setCurrentQuestionIndex(saved.currentQuestionIndex);
+      }
+    } catch {
+      // ignore malformed saved state
+    }
+  }, [attemptStorageKey, questions.length, sections.length]);
+
+  useEffect(() => {
+    if (!attemptStorageKey || !attemptId) return;
+    const stateToSave = {
+      answers: answerState,
+      visited: visitedQuestions,
+      sectionTimeSpent,
+      currentSectionIndex,
+      currentQuestionIndex,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(attemptStorageKey, JSON.stringify(stateToSave));
+  }, [answerState, attemptId, attemptStorageKey, currentQuestionIndex, currentSectionIndex, sectionTimeSpent, visitedQuestions]);
+
+  useEffect(() => {
+    if (!currentQuestion?.id) return;
+    setVisitedQuestions((prev) => {
+      if (prev[currentQuestion.id]) return prev;
+      return { ...prev, [currentQuestion.id]: true };
+    });
+  }, [currentQuestion]);
+
+  useEffect(() => {
+    if (!currentSection?.id || !hasActiveAttempt || loading) return undefined;
+    const interval = setInterval(() => {
+      setSectionTimeSpent((prev) => ({
+        ...prev,
+        [currentSection.id]: (prev[currentSection.id] || 0) + 1,
+      }));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [currentSection, hasActiveAttempt, loading]);
+
+  useEffect(() => {
+    if (!examId || loading || !hasActiveAttempt || !attemptId) return undefined;
     const timer = setInterval(() => {
       setTimeLeft((prev) => {
         if (prev <= 1) {
-          // Auto-submit this section
-          handleSubmitSection();
+          clearInterval(timer);
+          handleSubmit('timeout');
           return 0;
         }
         return prev - 1;
       });
     }, 1000);
 
-    return () => clearInterval(timer);
-  }, [sectionLocked, allSectionsSubmitted, sections.length]);
-
-  // Get current section and question
-  const currentSection = sections[currentSectionIdx];
-  const currentQuestion = currentSection?.questions[currentQIdx];
-  const isFirstQ = currentQIdx === 0;
-  const isLastQ = currentSection && currentQIdx === currentSection.questions.length - 1;
-  const isFirstSection = currentSectionIdx === 0;
-  const isLastSection = currentSectionIdx === sections.length - 1;
-
-  /* ── Answer ── */
-  const handleAnswerSelect = (optionId) => {
-    updateQuestion((q) => ({ ...q, selectedAnswer: optionId, status: 'visited' }));
-    setIsSaved(false); // mark as unsaved when answer changes
-  };
-
-  /* ── Update question in state ── */
-  const updateQuestion = useCallback((updater) => {
-    setSections((prevSections) => {
-      const newSections = prevSections.map((sec, sIdx) => {
-        if (sIdx !== currentSectionIdx) return sec;
-        return {
-          ...sec,
-          questions: sec.questions.map((q, qIdx) => {
-            if (qIdx !== currentQIdx) return q;
-            return updater(q);
-          }),
-        };
-      });
-      return newSections;
-    });
-  }, [currentSectionIdx, currentQIdx]);
-
-  /* ── Navigation ── */
-  const handlePrev = () => {
-    if (currentQIdx > 0) {
-      setCurrentQIdx(currentQIdx - 1);
-    }
-  };
-
-  const handleNext = () => {
-    if (currentSection && currentQIdx < currentSection.questions.length - 1) {
-      setCurrentQIdx(currentQIdx + 1);
-    }
-  };
-
-  const handleClearResponse = () => {
-    updateQuestion((q) => ({ ...q, selectedAnswer: null, status: 'visited' }));
-  };
-
-  const handleMarkForReview = () => {
-    updateQuestion((q) => ({ ...q, markedForReview: !q.markedForReview }));
-  };
-
-  const handleSave = () => {
-    // Save current response
-    const currentQuestionData = sections[currentSectionIdx]?.questions[currentQIdx];
-    if (currentQuestionData && currentQuestionData.selectedAnswer) {
-      // Update status to answered and save
-      setSections((prevSections) => {
-        const newSections = prevSections.map((sec, sIdx) => {
-          if (sIdx !== currentSectionIdx) return sec;
-          return {
-            ...sec,
-            questions: sec.questions.map((q, qIdx) => {
-              if (qIdx !== currentQIdx) return q;
-              return { ...q, status: 'answered' };
-            }),
-          };
-        });
-        // Save to localStorage
-        const allQuestions = newSections.flatMap(sec => sec.questions);
-        localStorage.setItem('cetQuestions', JSON.stringify(allQuestions));
-        return newSections;
-      });
-      setIsSaved(true); // mark as saved
-      // Show visual feedback
-      setTimeout(() => setIsSaved(false), 2000); // revert after 2 seconds
-    }
-  };
-
-  const handleSelectQuestion = (questionIdx) => {
-    setCurrentQIdx(questionIdx);
-  };
-
-  /* ── Submit section ── */
-  const handleSubmitSection = useCallback(() => {
-    // Submit this section
-    setSubmittedSections((prev) => [...prev, currentSectionIdx]);
-    setSectionLocked(true);
-
-    // If it's the last section, mark all as submitted
-    if (isLastSection) {
-      setAllSectionsSubmitted(true);
-    } else {
-      // Move to next section
-      setTimeout(() => {
-        setCurrentSectionIdx(currentSectionIdx + 1);
-        setCurrentQIdx(0);
-        setSectionLocked(false);
-        if (sectionDurations.length > currentSectionIdx + 1) {
-          setTimeLeft(sectionDurations[currentSectionIdx + 1]);
+    const poll = setInterval(async () => {
+      try {
+        const t = await fetchTimer(examId);
+        setTimeLeft(Math.max(0, Number(t.seconds_remaining || 0)));
+      } catch (err) {
+        if ((err?.message || '').toLowerCase().includes('no active attempt') && !submitRequestedRef.current) {
+          setHasActiveAttempt(false);
+          persistSubmissionContext({
+            end_time: new Date().toISOString(),
+            submission_reason: 'timeout',
+            submitted_student_name: student?.name || student?.username || 'Student',
+          });
+          navigate('/submitted');
         }
-      }, 1000);
-    }
-  }, [currentSectionIdx, isLastSection, sectionDurations]);
+        if (!submitRequestedRef.current) {
+          setError(err.message || 'Failed to sync timer');
+        }
+      }
+    }, 15000);
 
-  const handleConfirmSubmit = () => {
-    setShowSubmitModal(false);
-    handleSubmitSection();
+    return () => {
+      clearInterval(timer);
+      clearInterval(poll);
+    };
+  }, [attemptId, examId, handleSubmit, hasActiveAttempt, loading, navigate, persistSubmissionContext, student]);
+
+  const persistAnswer = async (questionId, next) => {
+    if (!attemptId) return;
+    await saveAnswer({
+      attempt_id: attemptId,
+      question_id: questionId,
+      selected_option: next.selected_option,
+      marked_for_review: !!next.marked_for_review,
+    });
   };
 
-  const handleCancelSubmit = () => {
-    setShowSubmitModal(false);
+  const updateAnswer = async (questionId, patch) => {
+    const current = answerState[questionId] || {
+      selected_option: null,
+      marked_for_review: false,
+    };
+    const next = { ...current, ...patch };
+    setAnswerState((prev) => ({ ...prev, [questionId]: next }));
+    setVisitedQuestions((prev) => ({ ...prev, [questionId]: true }));
+    try {
+      await persistAnswer(questionId, next);
+    } catch (err) {
+      setError(err.message || 'Unable to save answer');
+    }
   };
 
-  const handleSectionNavigate = (idx) => {
-    if (idx !== currentSectionIdx) {
-      setCurrentSectionIdx(idx);
-      setCurrentQIdx(0);
-      setShowSidebar(false);
-    }
+  const handleSwitchSection = (index) => {
+    setCurrentSectionIndex(index);
+    setCurrentQuestionIndex(0);
   };
 
   const formatTime = (seconds) => {
-    const hrs = Math.floor(seconds / 3600);
-    const mins = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    const total = Math.max(0, Number(seconds || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   };
 
-  if (sections.length === 0) {
+  if (loading) {
     return <div className="loading">Loading test...</div>;
   }
 
-  if (allSectionsSubmitted) {
-    return <TestSubmitted student={student} sections={sections} />;
+  if (error && questions.length === 0) {
+    return (
+      <div className="exam-error-container">
+        <div className="exam-error-box">
+          <h2>Unable to Start Exam</h2>
+          <p>{error}</p>
+          <button className="exam-error-btn" onClick={() => navigate('/dashboard')}>
+            Back to Dashboard
+          </button>
+        </div>
+      </div>
+    );
   }
 
+  const globalQuestionNumber = questions.findIndex(q => q.id === currentQuestion?.id) + 1;
+
   return (
-    <div className="test-layout">
-      {/* Header with Section Tabs */}
-      <div className="test-header-extended">
-        <div className="test-header">
-          <div className="header-title">CET Exam</div>
-          <div className="section-tabs">
-            {sections.map((section, idx) => (
-              <button
-                key={idx}
-                className={`section-tab ${idx === currentSectionIdx ? 'active' : ''}`}
-                onClick={() => handleSectionNavigate(idx)}
-              >
-                {section.name}
-              </button>
-            ))}
+    <div className="exam-container">
+      {/* HEADER */}
+      <div className="exam-header">
+        <div className="exam-header-left">
+          <div className="exam-logo">
+            <span className="exam-logo-icon">🔒</span>
+            <div className="exam-logo-text">
+              <div className="exam-logo-brand">SEB</div>
+              <div className="exam-logo-subtitle">SECURE EXAM PORTAL</div>
+            </div>
           </div>
-          <div className="timer" style={{ color: timeLeft < 600 ? '#ffeb3b' : 'white' }}>
-            ⏱️ {formatTime(timeLeft)}
+        </div>
+
+        <div className="exam-header-center">
+          <div className="exam-timer-label">TIME REMAINING:</div>
+          <div className={`exam-timer ${timeLeft < 600 ? 'warning' : ''}`}>
+            {formatTime(timeLeft)}
+            {timeLeft < 600 && <span className="timer-warning-icon">⚠️</span>}
           </div>
-          <button className="sidebar-toggle-btn" onClick={() => setShowSidebar(!showSidebar)}>
-            ☰
+        </div>
+
+        <div className="exam-header-right">
+          <div className="exam-user-profile">
+            <div className="user-avatar">👤</div>
+            <div className="user-info">
+              <div className="user-name">{student?.name || student?.username || 'Student'}</div>
+              <div className="user-status">Active</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* MAIN CONTENT */}
+      <div className="exam-main">
+        {/* LEFT SIDEBAR - QUESTION PALETTE */}
+        <QuestionPalette
+          questions={sectionQuestions.map((q, idx) => ({
+            id: idx + 1,
+            status: buildQuestionStatus(q),
+            markedForReview: !!answerState[q.id]?.marked_for_review,
+          }))}
+          currentQuestionId={currentQuestionIndex + 1}
+          onSelectQuestion={(n) => setCurrentQuestionIndex(Math.max(0, n - 1))}
+        />
+
+        {/* CENTER CONTENT - QUESTION AREA */}
+        <div className="exam-question-area">
+          {/* Section Header */}
+          {currentSection && (
+            <div className="exam-section-header">
+              <h2>{currentSection.name}</h2>
+              <p className="section-description">
+                {sectionQuestions.length} Questions
+              </p>
+            </div>
+          )}
+
+          {error ? <p className="exam-error-text">{error}</p> : null}
+
+          {currentQuestion ? (
+            <div className="exam-question-content">
+              {/* Question Number and Label */}
+              <div className="question-label">
+                Question {currentQuestionIndex + 1}: Read the case study on the left and answer the question below.
+              </div>
+
+              {/* Case Study if present */}
+              {currentQuestion.question_image_path && (
+                <div className="question-image-box">
+                  <div className="case-study-label">[Case Study: {currentSection?.name}]</div>
+                  <img
+                    src={mediaUrl(currentQuestion.question_image_path)}
+                    alt={`Question ${currentQuestionIndex + 1}`}
+                    className="question-image"
+                  />
+                </div>
+              )}
+
+              {/* Question Text */}
+              <div className="question-text-content">
+                <p>Question text: Which specific display technique was most effective according to the case study?</p>
+              </div>
+
+              {/* Options */}
+              <div className="options-box">
+                {[1, 2, 3, 4].map((optionNo) => {
+                  const optionLabel = String.fromCharCode(64 + optionNo);
+                  const selected = answerState[currentQuestion.id]?.selected_option === optionNo;
+                  return (
+                    <div key={optionNo} className={`option-item ${selected ? 'selected' : ''}`}>
+                      <input
+                        type="radio"
+                        id={`option-${currentQuestion.id}-${optionNo}`}
+                        name={`q-${currentQuestion.id}`}
+                        value={optionNo}
+                        checked={selected}
+                        onChange={() => updateAnswer(currentQuestion.id, { selected_option: optionNo })}
+                      />
+                      <label htmlFor={`option-${currentQuestion.id}-${optionNo}`}>
+                        <span className="option-letter">{optionLabel}</span>
+                        <span className="option-text">Option {optionLabel} text here</span>
+                      </label>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Action Buttons */}
+              <div className="exam-action-buttons">
+                <button
+                  className="exam-btn exam-btn-primary"
+                  onClick={() => updateAnswer(currentQuestion.id, {
+                    marked_for_review: !answerState[currentQuestion.id]?.marked_for_review,
+                  })}
+                  title={answerState[currentQuestion.id]?.marked_for_review ? 'Unmark for review' : 'Mark for review'}
+                >
+                  {answerState[currentQuestion.id]?.marked_for_review ? '✓ ' : ''}MARK FOR REVIEW & NEXT
+                </button>
+
+                <button
+                  className="exam-btn exam-btn-secondary"
+                  onClick={() => updateAnswer(currentQuestion.id, { selected_option: null })}
+                >
+                  CLEAR RESPONSE
+                </button>
+
+                <button
+                  className="exam-btn exam-btn-primary"
+                  disabled={currentQuestionIndex >= sectionQuestions.length - 1}
+                  onClick={() => setCurrentQuestionIndex((v) => Math.min(sectionQuestions.length - 1, v + 1))}
+                >
+                  SAVE & NEXT
+                </button>
+              </div>
+
+              {/* Navigation Buttons */}
+              <div className="exam-nav-buttons">
+                <button
+                  className="exam-nav-btn"
+                  disabled={currentQuestionIndex === 0 && currentSectionIndex === 0}
+                  onClick={() => {
+                    if (currentQuestionIndex > 0) {
+                      setCurrentQuestionIndex((v) => Math.max(0, v - 1));
+                    } else if (currentSectionIndex > 0) {
+                      handleSwitchSection(currentSectionIndex - 1);
+                    }
+                  }}
+                >
+                  ← PREVIOUS
+                </button>
+
+                <button
+                  className="exam-nav-btn"
+                  disabled={currentQuestionIndex >= sectionQuestions.length - 1 && currentSectionIndex >= sections.length - 1}
+                  onClick={() => {
+                    if (currentQuestionIndex < sectionQuestions.length - 1) {
+                      setCurrentQuestionIndex((v) => Math.min(sectionQuestions.length - 1, v + 1));
+                    } else if (currentSectionIndex < sections.length - 1) {
+                      handleSwitchSection(currentSectionIndex + 1);
+                    }
+                  }}
+                >
+                  {currentSectionIndex >= sections.length - 1 && currentQuestionIndex >= sectionQuestions.length - 1
+                    ? 'REVIEW ANSWERS'
+                    : 'SAVE & NEXT →'}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="no-questions-text">No questions loaded.</p>
+          )}
+        </div>
+      </div>
+
+      {/* FOOTER */}
+      <div className="exam-footer">
+        <div className="exam-footer-left">
+          <span className="question-counter">Question {currentQuestionIndex + 1} of {sectionQuestions.length}</span>
+        </div>
+        <div className="exam-footer-center">
+          <span className="exam-language">Language: English</span>
+        </div>
+        <div className="exam-footer-right">
+          <span className="exam-status">Exam: {exam?.name || 'CET'}</span>
+          <span className="status-indicator">Status: Active</span>
+          <button
+            className="exam-submit-btn"
+            onClick={() => setShowSubmitModal(true)}
+            disabled={submitting || !hasActiveAttempt}
+          >
+            {submitting ? '⏳ SUBMITTING...' : '✓ SUBMIT EXAM'}
           </button>
         </div>
       </div>
 
-      {/* Current Section Information Card */}
-      <div className="section-info-card">
-        <div className="section-info-label">CURRENT SECTION</div>
-        <div className="section-info-main">
-          <h2 className="section-info-title">{currentSection?.name}</h2>
-          <div className="section-info-questions">
-            <span className="questions-label">Questions</span>
-            <span className="questions-count">{currentQIdx + 1} / {currentSection?.questions.length}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Main Content */}
-      <div style={{ display: 'flex', width: '100%', marginTop: '250px' }}>
-        {/* Sidebar - Question Palette */}
-        {showSidebar && currentSection && (
-          <QuestionPalette
-            questions={currentSection.questions.map((q, idx) => ({
-              ...q,
-              id: idx,
-            }))}
-            currentQuestionId={currentQIdx}
-            onSelectQuestion={handleSelectQuestion}
-          />
-        )}
-
-        {/* Main Test Content */}
-        <div className="test-content" style={{ flex: 1, padding: '30px', overflow: 'auto' }}>
-          <div className="question-container">
-            {/* Question */}
-            <div className="question-text">{currentQuestion?.question}</div>
-
-            {/* Image */}
-            {currentQuestion?.imageData && (
-              <div className="question-image-container">
-                <img
-                  src={currentQuestion.imageData}
-                  alt="Question"
-                  className="question-image"
-                />
-              </div>
-            )}
-            {currentQuestion?.imageQuestion &&
-              currentQuestion.imageQuestion.trim() !== '' &&
-              !currentQuestion.imageData && (
-                <div className="question-image-placeholder">
-                  🖼️ Image: <strong>{currentQuestion.imageQuestion}</strong>
-                </div>
-              )}
-
-            {/* Options */}
-            <div className="options">
-              {currentQuestion?.options.map((option, index) => {
-                const label = String.fromCharCode(65 + index);
-                const isSelected = currentQuestion.selectedAnswer === option.id;
-                const isAnswered = isSelected && currentQuestion.status === 'answered';
-                return (
-                  <div
-                    key={option.id}
-                    className={`option ${isSelected ? 'selected' : ''} ${isAnswered ? 'answered' : ''}`}
-                    style={{ opacity: sectionLocked ? 0.7 : 1 }}
-                  >
-                    <label>
-                      <input
-                        type="radio"
-                        name={`q-${currentSectionIdx}-${currentQIdx}`}
-                        value={option.id}
-                        checked={isSelected}
-                        onChange={() => handleAnswerSelect(option.id)}
-                        disabled={sectionLocked}
-                      />
-                      <span className="option-label">{label}</span>
-                      <span className="option-text">{option.text}</span>
-                    </label>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* ═══ NAVIGATION ═══ */}
-          <div className="question-navigation">
-            <button className="nav-btn" onClick={handlePrev} disabled={isFirstQ || sectionLocked}>
-              ← Previous
-            </button>
-            <button className="nav-btn nav-action-btn clear-response-btn" onClick={handleClearResponse} disabled={sectionLocked}>
-              Clear Response
-            </button>
-            <button
-              className={`nav-btn nav-action-btn ${isSaved ? 'saved' : ''}`}
-              onClick={handleSave}
-              disabled={sectionLocked}
-              title={isSaved ? 'Answer saved successfully' : 'Click to save'}
-            >
-              🔒 Save
-            </button>
-            <button
-              className={`nav-btn nav-action-btn ${currentQuestion?.markedForReview ? 'marked' : ''}`}
-              onClick={handleMarkForReview}
-              disabled={sectionLocked}
-            >
-              Mark for Review
-            </button>
-            <button className="nav-btn" onClick={handleNext} disabled={isLastQ || sectionLocked}>
-              Next →
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Submit Modal */}
-      {showSubmitModal && (
+      {/* SUBMIT MODAL */}
+      {showSubmitModal ? (
         <SubmitModal
-          sectionName={currentSection?.name}
-          onConfirm={handleConfirmSubmit}
-          onCancel={handleCancelSubmit}
+          questions={questions.map((q) => ({ status: buildQuestionStatus(q) }))}
+          onConfirm={() => handleSubmit('manual')}
+          onCancel={() => setShowSubmitModal(false)}
         />
-      )}
-
-      {/* Submit Button */}
-      <button
-        className="bottom-right-submit-btn"
-        onClick={() => setShowSubmitModal(true)}
-        disabled={sectionLocked}
-      >
-        Submit Section
-      </button>
-    </div>
-  );
-}
-
-/* ── Test Submitted Page ── */
-function TestSubmitted({ student, sections }) {
-  return (
-    <div className="submitted-box">
-      <div className="submitted-content">
-        <h1>✓ Test Submitted Successfully</h1>
-        <p>Thank you for completing the test, {student?.name || 'Student'}!</p>
-        <div className="submitted-details">
-          <p><strong>Roll Number:</strong> {student?.rollNumber || 'N/A'}</p>
-          <p><strong>Total Sections:</strong> {sections.length}</p>
-        </div>
-        <button className="btn btn-primary" onClick={() => window.location.href = '/'}>
-          Back to Dashboard
-        </button>
-      </div>
+      ) : null}
     </div>
   );
 }
